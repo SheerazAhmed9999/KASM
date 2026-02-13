@@ -85,7 +85,6 @@ jobs:
             --provisioning-model=STANDARD \
             --network=default \
             --subnet=default \
-            --no-address \
             --image-project="${{ env.WINDOWS_IMAGE_PROJECT }}" \
             --image-family="${{ steps.win.outputs.family }}" \
             --boot-disk-size="${{ env.DISK_SIZE }}" \
