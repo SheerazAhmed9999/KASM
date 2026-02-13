@@ -1,0 +1,154 @@
+name: Build Windows Golden Image (GCP)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_ID: kasm-485616
+  REGION: us-central1
+  ZONE: us-central1-f
+
+  MACHINE_TYPE: e2-medium
+  DISK_TYPE: pd-standard
+  DISK_SIZE: 50GB
+
+  IMAGE_PREFIX: gitvm
+  IMAGE_FAMILY: gitvm-family
+
+  WINDOWS_IMAGE_PROJECT: windows-cloud
+  WINDOWS_FAMILY_PRIMARY: windows-2025
+  WINDOWS_FAMILY_FALLBACK: windows-2022
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Auth using Service Account JSON key (your choice)
+      - name: Auth to Google Cloud (Service Account JSON)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Compute names (date/time in name)
+        id: names
+        shell: bash
+        run: |
+          TS="$(date -u +%Y%m%d-%H%M%S)"
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+          echo "vm=${{ env.IMAGE_PREFIX }}-build-$TS" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.IMAGE_PREFIX }}-$TS" >> "$GITHUB_OUTPUT"
+
+      - name: Pick Windows image family (try 2025, else 2022)
+        id: win
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          exists_family () {
+            local fam="$1"
+            gcloud compute images list \
+              --project="${{ env.WINDOWS_IMAGE_PROJECT }}" \
+              --filter="family=($fam)" \
+              --limit=1 \
+              --format="value(name)" | grep -q .
+          }
+
+          if exists_family "${{ env.WINDOWS_FAMILY_PRIMARY }}"; then
+            echo "family=${{ env.WINDOWS_FAMILY_PRIMARY }}" >> "$GITHUB_OUTPUT"
+            echo "Using Windows family: ${{ env.WINDOWS_FAMILY_PRIMARY }}"
+          else
+            echo "family=${{ env.WINDOWS_FAMILY_FALLBACK }}" >> "$GITHUB_OUTPUT"
+            echo "Windows 2025 family not found; falling back to: ${{ env.WINDOWS_FAMILY_FALLBACK }}"
+          fi
+
+      - name: Create Windows VM (NO external IP, default network)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gcloud compute instances create "${{ steps.names.outputs.vm }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --zone="${{ env.ZONE }}" \
+            --machine-type="${{ env.MACHINE_TYPE }}" \
+            --provisioning-model=STANDARD \
+            --network=default \
+            --subnet=default \
+            --no-address \
+            --image-project="${{ env.WINDOWS_IMAGE_PROJECT }}" \
+            --image-family="${{ steps.win.outputs.family }}" \
+            --boot-disk-size="${{ env.DISK_SIZE }}" \
+            --boot-disk-type="${{ env.DISK_TYPE }}" \
+            --scopes=https://www.googleapis.com/auth/cloud-platform
+
+      - name: Attach startup script (run updates)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute instances add-metadata "${{ steps.names.outputs.vm }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --zone="${{ env.ZONE }}" \
+            --metadata-from-file windows-startup-script-ps1="scripts/windows-update.ps1"
+
+      - name: Reset VM (trigger startup script cleanly)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute instances reset "${{ steps.names.outputs.vm }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --zone="${{ env.ZONE }}"
+
+      - name: Wait for VM to stop (updates finished)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for VM to reach TERMINATED..."
+          for i in $(seq 1 180); do
+            status="$(gcloud compute instances describe "${{ steps.names.outputs.vm }}" \
+              --project="${{ env.PROJECT_ID }}" --zone="${{ env.ZONE }}" \
+              --format='value(status)')"
+            echo "Status: $status"
+            if [[ "$status" == "TERMINATED" ]]; then
+              echo "VM is TERMINATED. Proceeding to image creation."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for VM to stop."
+          exit 1
+
+      - name: Create image from VM boot disk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DISK="$(gcloud compute instances describe "${{ steps.names.outputs.vm }}" \
+            --project="${{ env.PROJECT_ID }}" --zone="${{ env.ZONE }}" \
+            --format="value(disks[0].source.basename())")"
+          echo "Boot disk: $DISK"
+
+          gcloud compute images create "${{ steps.names.outputs.image }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --source-disk="$DISK" \
+            --source-disk-zone="${{ env.ZONE }}" \
+            --family="${{ env.IMAGE_FAMILY }}" \
+            --storage-location="${{ env.REGION }}"
+
+      - name: Cleanup (delete VM)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          gcloud compute instances delete "${{ steps.names.outputs.vm }}" \
+            --project="${{ env.PROJECT_ID }}" --zone="${{ env.ZONE }}" --quiet
